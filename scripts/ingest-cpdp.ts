@@ -3,16 +3,22 @@
  * CPDP ingestion crawler — decisions, opinions, and guidance from cpdp.bg.
  *
  * The CPDP website has two parallel structures:
- *   1. WordPress site (cpdp.bg) — decisions and opinions by year as WP category pages
- *      - Decisions: /category/решения-на-кзлд-за-{year}-г/  (+ /page/N)
- *      - Opinions:  /category/становища-на-кзлд-за-{year}-г/ (+ /page/N)
- *   2. Legacy PHP site (www.cpdp.bg) — practice section
+ *   1. WordPress site (cpdp.bg) — decisions and opinions by year as WP categories
+ *      - Discovery via WP REST API: /wp-json/wp/v2/categories + /wp-json/wp/v2/posts
+ *      - Category names: "Решения на КЗЛД за {year} г." / "Становища на КЗЛД за {year} г."
+ *      - NOTE: HTML category archives do NOT render posts (Elementor theme shows empty
+ *        "section-empty" div despite posts existing). REST API is the only reliable path.
+ *   2. Legacy PHP site (www.cpdp.bg) — practice section (redirects to cpdp.bg)
  *      - Practice index: /index.php?p=rubric&aid=3
  *      - Year rubrics: /index.php?p=rubric_element&aid={N}
  *      - Individual items: /index.php?p=element_view&aid={N}
  *
- * This crawler targets the WordPress site as primary source (better structured
- * HTML, standard pagination). Falls back to the legacy PHP site for older content.
+ * This crawler uses the WP REST API as primary discovery source (structured JSON,
+ * no HTML parsing needed for listings). Falls back to legacy PHP site for older content.
+ * Detail pages are still fetched as HTML and parsed with cheerio.
+ *
+ * SSL note: cpdp.bg serves an incomplete certificate chain (missing intermediate).
+ * This script sets NODE_TLS_REJECT_UNAUTHORIZED=0 to work around the issue.
  *
  * Usage:
  *   npx tsx scripts/ingest-cpdp.ts
@@ -21,6 +27,14 @@
  *   npx tsx scripts/ingest-cpdp.ts --force --year-start 2022 --year-end 2024
  *   npx tsx scripts/ingest-cpdp.ts --limit 10 --verbose
  */
+
+/**
+ * cpdp.bg serves an incomplete SSL certificate chain (missing Thawte TLS RSA
+ * CA G1 intermediate). Node.js rejects the connection by default. Setting
+ * NODE_TLS_REJECT_UNAUTHORIZED=0 before any imports that open connections
+ * works around this. Scoped to this ingestion script only.
+ */
+process.env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0";
 
 import Database from "better-sqlite3";
 import * as cheerio from "cheerio";
@@ -46,10 +60,12 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const BASE_URL = "https://cpdp.bg";
 const LEGACY_BASE_URL = "https://www.cpdp.bg";
 
-/** WordPress category URL slugs for decisions by year. */
-const DECISIONS_CATEGORY_SLUG = "решения-на-кзлд-за";
-/** WordPress category URL slugs for opinions by year. */
-const OPINIONS_CATEGORY_SLUG = "становища-на-кзлд-за";
+/** WP REST API base for structured discovery (more reliable than HTML scraping). */
+const WP_API_URL = `${BASE_URL}/wp-json/wp/v2`;
+
+/** Category name prefixes for matching via WP REST API. */
+const DECISIONS_CATEGORY_PREFIX = "Решения на КЗЛД за";
+const OPINIONS_CATEGORY_PREFIX = "Становища на КЗЛД за";
 
 const USER_AGENT =
   "Ansvar-CPDP-Crawler/1.0 (+https://ansvar.eu; compliance research)";
@@ -184,6 +200,65 @@ async function fetchWithRetry(url: string, retries = MAX_RETRIES): Promise<strin
   throw new Error("fetchWithRetry: exhausted retries");
 }
 
+/**
+ * Fetch JSON from the WP REST API with retries.
+ * Sends Accept: application/json so the API returns JSON, not HTML.
+ */
+async function fetchJson<T>(url: string, retries = MAX_RETRIES): Promise<T> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+      const res = await fetch(url, {
+        headers: {
+          "User-Agent": USER_AGENT,
+          "Accept": "application/json",
+        },
+        signal: controller.signal,
+      });
+
+      clearTimeout(timeout);
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      }
+
+      return (await res.json()) as T;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (attempt < retries) {
+        const delay = RETRY_BACKOFF_MS * attempt;
+        console.warn(`  [retry ${attempt}/${retries}] ${url} — ${msg} (waiting ${delay}ms)`);
+        await sleep(delay);
+      } else {
+        throw new Error(`Failed after ${retries} attempts: ${url} — ${msg}`);
+      }
+    }
+  }
+  throw new Error("fetchJson: exhausted retries");
+}
+
+// ---------------------------------------------------------------------------
+// WP REST API types
+// ---------------------------------------------------------------------------
+
+interface WpCategory {
+  id: number;
+  count: number;
+  name: string;
+  slug: string;
+  parent: number;
+}
+
+interface WpPost {
+  id: number;
+  date: string;
+  link: string;
+  title: { rendered: string };
+  content: { rendered: string };
+}
+
 // ---------------------------------------------------------------------------
 // State persistence (for --resume)
 // ---------------------------------------------------------------------------
@@ -206,73 +281,116 @@ function saveState(state: IngestState): void {
 }
 
 // ---------------------------------------------------------------------------
-// WordPress category page crawler
+// WordPress REST API discovery
 // ---------------------------------------------------------------------------
 
 /**
- * Build the WordPress category URL for a given year and content kind.
+ * Discover WP category IDs for decisions/opinions by year range via REST API.
  *
- * Pattern: https://cpdp.bg/category/{slug}-{year}-г/
- * Pagination: https://cpdp.bg/category/{slug}-{year}-г/page/{n}/
+ * The cpdp.bg WP theme does not render standard <article> elements on category
+ * archive pages (it uses Elementor and shows "section-empty" even when posts
+ * exist). The REST API is the reliable path to enumerate posts.
+ *
+ * Category name pattern: "Решения на КЗЛД за {year} г." / "Становища на КЗЛД за {year} г."
  */
-function buildCategoryUrl(kind: "decision" | "opinion", year: number, page: number): string {
-  const slug = kind === "decision" ? DECISIONS_CATEGORY_SLUG : OPINIONS_CATEGORY_SLUG;
-  const base = `${BASE_URL}/category/${encodeURIComponent(slug)}-${year}-г/`;
-  return page <= 1 ? base : `${base}page/${page}/`;
+async function discoverWpCategoryIds(
+  kind: "decision" | "opinion",
+  yearStart: number,
+  yearEnd: number,
+  verbose: boolean,
+): Promise<Map<number, { catId: number; year: number }>> {
+  const prefix = kind === "decision" ? DECISIONS_CATEGORY_PREFIX : OPINIONS_CATEGORY_PREFIX;
+  const result = new Map<number, { catId: number; year: number }>();
+
+  // Fetch all categories matching the prefix (paginate — WP default limit is 10)
+  let page = 1;
+  let hasMore = true;
+  while (hasMore) {
+    const url = `${WP_API_URL}/categories?per_page=100&page=${page}&search=${encodeURIComponent(prefix)}`;
+    if (verbose) console.log(`  [api] Fetching categories page ${page}: ${url}`);
+
+    try {
+      const cats = await fetchJson<WpCategory[]>(url);
+      for (const cat of cats) {
+        // Match exact prefix pattern: "{prefix} {year} г."
+        const yearMatch = cat.name.match(new RegExp(`^${prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(\\d{4})\\s+г\\.?$`));
+        if (!yearMatch) continue;
+        const year = parseInt(yearMatch[1]!, 10);
+        if (year < yearStart || year > yearEnd) continue;
+        if (cat.count === 0) continue;
+
+        result.set(year, { catId: cat.id, year });
+        if (verbose) console.log(`    ${cat.name}: id=${cat.id}, ${cat.count} posts`);
+      }
+      hasMore = cats.length === 100; // full page means there might be more
+      page++;
+      await sleep(RATE_LIMIT_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`  [api] Error fetching categories: ${msg}`);
+      hasMore = false;
+    }
+  }
+
+  return result;
 }
 
 /**
- * Parse a WordPress category listing page. Returns entries found on the page
- * and whether there is a next page.
+ * Fetch all posts from a WP category by ID, handling pagination.
+ * Returns ListingEntry items suitable for detail fetching.
  */
-function parseCategoryPage(html: string, kind: "decision" | "opinion"): {
-  entries: ListingEntry[];
-  hasNext: boolean;
-} {
-  const $ = cheerio.load(html);
+async function fetchPostsFromCategory(
+  catId: number,
+  kind: "decision" | "opinion",
+  verbose: boolean,
+): Promise<ListingEntry[]> {
   const entries: ListingEntry[] = [];
+  let page = 1;
+  let hasMore = true;
 
-  // WordPress article listings — common patterns:
-  // <article> with <h2 class="entry-title"><a href="...">Title</a></h2>
-  // or <div class="post-..."> structures
-  $("article, .post, .entry, .type-post").each((_i, el) => {
-    const $el = $(el);
+  while (hasMore) {
+    const url = `${WP_API_URL}/posts?categories=${catId}&per_page=100&page=${page}`;
+    if (verbose) console.log(`  [api] Fetching posts catId=${catId} page ${page}`);
 
-    // Title + URL from heading link
-    const $link =
-      $el.find("h2.entry-title a, h2 a, h3.entry-title a, h3 a, .entry-title a").first();
-    const href = $link.attr("href");
-    const title = $link.text().trim();
+    try {
+      const posts = await fetchJson<WpPost[]>(url);
+      for (const post of posts) {
+        // Strip HTML entities from title
+        const title = post.title.rendered
+          .replace(/&#8211;/g, "–")
+          .replace(/&#8212;/g, "—")
+          .replace(/&#8216;/g, "\u2018")
+          .replace(/&#8217;/g, "\u2019")
+          .replace(/&#8220;/g, "\u201c")
+          .replace(/&#8221;/g, "\u201d")
+          .replace(/&#8230;/g, "\u2026")
+          .replace(/&amp;/g, "&")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&quot;/g, "\"")
+          .replace(/&#8470;/g, "\u2116")
+          .replace(/&#\d+;/g, "");
 
-    if (!href || !title) return;
+        const date = post.date ? post.date.slice(0, 10) : null;
+        entries.push({ url: post.link, title, date, kind });
+      }
 
-    // Date — WordPress usually outputs <time datetime="..."> or .entry-date
-    let date: string | null = null;
-    const $time = $el.find("time[datetime]").first();
-    if ($time.length) {
-      const dt = $time.attr("datetime");
-      if (dt) {
-        date = dt.slice(0, 10); // YYYY-MM-DD
+      hasMore = posts.length === 100;
+      page++;
+      await sleep(RATE_LIMIT_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // WP returns 400 for pages beyond the last — not an error
+      if (/400/.test(msg)) {
+        hasMore = false;
+      } else {
+        console.error(`  [api] Error fetching posts for catId=${catId}: ${msg}`);
+        hasMore = false;
       }
     }
-    if (!date) {
-      // Try .entry-date or .posted-on text
-      const dateText = $el.find(".entry-date, .posted-on, .date").first().text().trim();
-      const m = dateText.match(/(\d{1,2})\.(\d{1,2})\.(\d{4})/);
-      if (m) {
-        date = `${m[3]}-${m[2]!.padStart(2, "0")}-${m[1]!.padStart(2, "0")}`;
-      }
-    }
+  }
 
-    entries.push({ url: href, title, date, kind });
-  });
-
-  // Detect next page — WP pagination: <a class="next page-numbers" ...>
-  // or <div class="nav-links"> <a ...>Next</a>
-  const hasNext =
-    $("a.next.page-numbers, a.next, .nav-links a.next, .pagination a.next").length > 0;
-
-  return { entries, hasNext };
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -542,6 +660,14 @@ function parseDetailPage(html: string, fallbackTitle: string): ParsedDetail {
 // Discovery: collect listing entries from both site versions
 // ---------------------------------------------------------------------------
 
+/**
+ * Discover entries via the WP REST API.
+ *
+ * The WordPress theme on cpdp.bg (Flavor + Elementor) does not render standard
+ * <article> elements on category archive pages — category pages return HTTP 200
+ * with an empty "section-empty not-found" div even when posts exist. The REST
+ * API at /wp-json/wp/v2/ is the reliable path.
+ */
 async function discoverWpEntries(
   kind: "decision" | "opinion",
   yearStart: number,
@@ -550,41 +676,21 @@ async function discoverWpEntries(
 ): Promise<ListingEntry[]> {
   const all: ListingEntry[] = [];
 
-  for (let year = yearStart; year <= yearEnd; year++) {
-    let page = 1;
-    let hasNext = true;
+  // Step 1: discover category IDs matching the year range
+  const categoryMap = await discoverWpCategoryIds(kind, yearStart, yearEnd, verbose);
 
-    while (hasNext) {
-      const url = buildCategoryUrl(kind, year, page);
-      if (verbose) console.log(`  [wp] ${kind} ${year} page ${page}: ${url}`);
+  if (categoryMap.size === 0) {
+    if (verbose) console.log(`  [api] No ${kind} categories found for ${yearStart}–${yearEnd}`);
+    return all;
+  }
 
-      try {
-        const html = await fetchWithRetry(url);
-        const result = parseCategoryPage(html, kind);
-
-        if (result.entries.length === 0 && page === 1) {
-          // Year category may not exist — not an error
-          if (verbose) console.log(`    No entries (category may not exist for ${year})`);
-          break;
-        }
-
-        all.push(...result.entries);
-        hasNext = result.hasNext;
-        page++;
-
-        if (verbose) console.log(`    Found ${result.entries.length} entries`);
-        await sleep(RATE_LIMIT_MS);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        // 404 on first page means the year category does not exist — skip
-        if (page === 1 && /404/.test(msg)) {
-          if (verbose) console.log(`    Year ${year} not found (404) — skipping`);
-          break;
-        }
-        console.error(`  [wp] Error fetching ${kind} ${year} page ${page}: ${msg}`);
-        hasNext = false;
-      }
-    }
+  // Step 2: fetch posts from each category
+  const catEntries = Array.from(categoryMap.entries());
+  for (const [year, { catId }] of catEntries) {
+    if (verbose) console.log(`  [api] Fetching ${kind} posts for ${year} (catId=${catId})`);
+    const entries = await fetchPostsFromCategory(catId, kind, verbose);
+    all.push(...entries);
+    if (verbose) console.log(`    ${year}: ${entries.length} entries`);
   }
 
   return all;
@@ -780,8 +886,8 @@ async function main(): Promise<void> {
   const allEntries = deduplicateEntries([...wpDecisions, ...wpOpinions, ...legacyEntries]);
 
   console.log(`\nDiscovery complete:`);
-  console.log(`  WordPress decisions: ${wpDecisions.length}`);
-  console.log(`  WordPress opinions:  ${wpOpinions.length}`);
+  console.log(`  WP API decisions:    ${wpDecisions.length}`);
+  console.log(`  WP API opinions:     ${wpOpinions.length}`);
   console.log(`  Legacy entries:      ${legacyEntries.length}`);
   console.log(`  After dedup:         ${allEntries.length}`);
 
