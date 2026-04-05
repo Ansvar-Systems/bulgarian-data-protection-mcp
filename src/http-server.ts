@@ -29,6 +29,7 @@ import {
   searchGuidelines,
   getGuideline,
   listTopics,
+  getDbStats,
 } from "./db.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -53,11 +54,11 @@ const TOOLS = [
   {
     name: "bg_dp_search_decisions",
     description:
-      "Full-text search across CNIL decisions (deliberations, sanctions, mises en demeure). Returns matching decisions with reference, entity name, fine amount, and GDPR articles cited.",
+      "Full-text search across CPDP decisions (решения, наказателни постановления, предписания). Returns matching decisions with reference, entity name, fine amount, and GDPR articles cited.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        query: { type: "string", description: "Search query (e.g., 'consentement cookies', 'Google')" },
+        query: { type: "string", description: "Search query (e.g., 'съгласие бисквитки', 'ДСК Банк', 'нарушение данни')" },
         type: {
           type: "string",
           enum: ["наказателно_постановление", "предписание", "решение", "становище"],
@@ -72,11 +73,11 @@ const TOOLS = [
   {
     name: "bg_dp_get_decision",
     description:
-      "Get a specific CNIL decision by reference number (e.g., 'SAN-2022-009').",
+      "Get a specific CPDP decision by reference number (e.g., 'EAJ-1234/2022', 'НП-2022-100').",
     inputSchema: {
       type: "object" as const,
       properties: {
-        reference: { type: "string", description: "CNIL decision reference (e.g., 'SAN-2022-009')" },
+        reference: { type: "string", description: "CPDP decision reference (e.g., 'EAJ-1234/2022', 'НП-2022-100')" },
       },
       required: ["reference"],
     },
@@ -84,11 +85,11 @@ const TOOLS = [
   {
     name: "bg_dp_search_guidelines",
     description:
-      "Search CNIL guidance documents: guides, recommandations, referentiels, and FAQs.",
+      "Search CPDP guidance documents: становища, насоки, and методически указания. Covers GDPR implementation, ОВЛПД (DPIA), cookie consent, video surveillance, and more.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        query: { type: "string", description: "Search query" },
+        query: { type: "string", description: "Search query (e.g., 'ОВЛПД', 'бисквитки съгласие', 'видеонаблюдение')" },
         type: {
           type: "string",
           enum: ["становище", "насока", "методически_указания", "ръководство"],
@@ -102,7 +103,7 @@ const TOOLS = [
   },
   {
     name: "bg_dp_get_guideline",
-    description: "Get a specific CNIL guidance document by its database ID.",
+    description: "Get a specific CPDP guidance document by its database ID.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -113,12 +114,22 @@ const TOOLS = [
   },
   {
     name: "bg_dp_list_topics",
-    description: "List all covered data protection topics with French and English names.",
+    description: "List all covered data protection topics with Bulgarian and English names. Use topic IDs to filter decisions and guidelines.",
     inputSchema: { type: "object" as const, properties: {}, required: [] },
   },
   {
     name: "bg_dp_about",
     description: "Return metadata about this MCP server: version, data source, coverage, and tool list.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] },
+  },
+  {
+    name: "bg_dp_list_sources",
+    description: "List authoritative data sources used by this MCP server, including provenance, license, and update frequency.",
+    inputSchema: { type: "object" as const, properties: {}, required: [] },
+  },
+  {
+    name: "bg_dp_check_data_freshness",
+    description: "Check the freshness of the local database: record counts and latest document dates for decisions and guidelines.",
     inputSchema: { type: "object" as const, properties: {}, required: [] },
   },
 ];
@@ -162,9 +173,16 @@ function createMcpServer(): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args = {} } = request.params;
 
+    const META = {
+      disclaimer: "For informational purposes only. Verify all references against primary sources before making compliance decisions.",
+      copyright: "Data sourced from CPDP (https://www.cpdp.bg/). Official Bulgarian regulatory publications.",
+      source_url: "https://www.cpdp.bg/",
+    };
+
     function textContent(data: unknown) {
+      const payload = typeof data === "object" && data !== null ? { ...data as object, _meta: META } : data;
       return {
-        content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+        content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
       };
     }
 
@@ -227,9 +245,50 @@ function createMcpServer(): Server {
             name: SERVER_NAME,
             version: pkgVersion,
             description:
-              "CPDP (Комисия за защита на личните данни) MCP server. Provides access to French data protection authority decisions, sanctions, mises en demeure, and official guidance documents.",
+              "CPDP (Комисия за защита на личните данни) MCP server. Provides access to Bulgarian data protection authority decisions, sanctions, наказателни постановления, and official guidance documents.",
             data_source: "CPDP (https://www.cpdp.bg/)",
+            coverage: {
+              decisions: "CPDP решения, наказателни постановления, and предписания",
+              guidelines: "CPDP становища, насоки, and методически указания",
+              topics: "Consent (съгласие), cookies (бисквитки), transfers, DPIA (ОВЛПД), breach notification, privacy by design, video surveillance (видеонаблюдение), health data, children",
+            },
             tools: TOOLS.map((t) => ({ name: t.name, description: t.description })),
+          });
+        }
+
+        case "bg_dp_list_sources": {
+          return textContent({
+            sources: [
+              {
+                id: "cpdp",
+                name: "CPDP — Комисия за защита на личните данни",
+                name_en: "Commission for Personal Data Protection",
+                url: "https://www.cpdp.bg/",
+                authority: "Bulgarian Data Protection Authority",
+                jurisdiction: "Bulgaria",
+                license: "Open government data — official regulatory publications",
+                update_frequency: "Periodic",
+                coverage: "Decisions (решения, наказателни постановления, предписания), guidelines (становища, насоки, методически указания), and topics",
+              },
+            ],
+          });
+        }
+
+        case "bg_dp_check_data_freshness": {
+          const stats = getDbStats();
+          return textContent({
+            status: "ok",
+            database_path: process.env["CPDP_DB_PATH"] ?? "data/cpdp.db",
+            record_counts: {
+              decisions: stats.decisions_count,
+              guidelines: stats.guidelines_count,
+              topics: stats.topics_count,
+            },
+            latest_dates: {
+              decision: stats.latest_decision_date ?? "none",
+              guideline: stats.latest_guideline_date ?? "none",
+            },
+            note: "Database updates are periodic. Verify against https://www.cpdp.bg/ for the most recent publications.",
           });
         }
 
