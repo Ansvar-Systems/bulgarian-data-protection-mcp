@@ -1,0 +1,39 @@
+{
+  "server": "bulgarian-data-protection-mcp",
+  "jurisdiction": "Bulgaria",
+  "authority": "CPDP — Комисия за защита на личните данни",
+  "authority_en": "Commission for Personal Data Protection",
+  "authority_url": "https://www.cpdp.bg/",
+  "license": "Open government data — official regulatory publications",
+  "update_frequency": "Periodic",
+  "document_types": {
+    "decisions": [
+      "наказателно_постановление",
+      "предписание",
+      "решение",
+      "становище"
+    ],
+    "guidelines": [
+      "становище",
+      "насока",
+      "методически_указания",
+      "ръководство"
+    ]
+  },
+  "topics": [
+    { "id": "consent", "bg": "Съгласие", "en": "Consent" },
+    { "id": "cookies", "bg": "Бисквитки", "en": "Cookies" },
+    { "id": "transfers", "bg": "Трансфер на данни", "en": "Data transfers" },
+    { "id": "dpia", "bg": "ОВЛПД", "en": "Data Protection Impact Assessment" },
+    { "id": "breach_notification", "bg": "Уведомяване за нарушение", "en": "Breach notification" },
+    { "id": "privacy_by_design", "bg": "Защита на данните при проектирането", "en": "Privacy by design" },
+    { "id": "video_surveillance", "bg": "Видеонаблюдение", "en": "Video surveillance" },
+    { "id": "health_data", "bg": "Здравни данни", "en": "Health data" },
+    { "id": "children", "bg": "Деца", "en": "Children" }
+  ],
+  "limitations": [
+    "Coverage may be incomplete — not all CPDP publications may be ingested",
+    "Database updates are periodic and may lag official publications",
+    "Always verify against primary sources at https://www.cpdp.bg/"
+  ]
+}

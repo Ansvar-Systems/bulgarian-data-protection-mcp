@@ -25,6 +25,7 @@ import {
   searchGuidelines,
   getGuideline,
   listTopics,
+  getDbStats,
 } from "./db.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -150,6 +151,24 @@ const TOOLS = [
       required: [],
     },
   },
+  {
+    name: "bg_dp_list_sources",
+    description: "List authoritative data sources used by this MCP server, including provenance, license, and update frequency.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "bg_dp_check_data_freshness",
+    description: "Check the freshness of the local database: record counts and latest document dates for decisions and guidelines.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+      required: [],
+    },
+  },
 ];
 
 // --- Zod schemas for argument validation --------------------------------------
@@ -178,10 +197,17 @@ const GetGuidelineArgs = z.object({
 
 // --- Helper ------------------------------------------------------------------
 
+const META = {
+  disclaimer: "For informational purposes only. Verify all references against primary sources before making compliance decisions.",
+  copyright: "Data sourced from CPDP (https://www.cpdp.bg/). Official Bulgarian regulatory publications.",
+  source_url: "https://www.cpdp.bg/",
+};
+
 function textContent(data: unknown) {
+  const payload = typeof data === "object" && data !== null ? { ...data as object, _meta: META } : data;
   return {
     content: [
-      { type: "text" as const, text: JSON.stringify(data, null, 2) },
+      { type: "text" as const, text: JSON.stringify(payload, null, 2) },
     ],
   };
 }
@@ -267,6 +293,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             topics: "Consent (съгласие), cookies (бисквитки), transfers, DPIA (ОВЛПД), breach notification, privacy by design, video surveillance (видеонаблюдение), health data, children",
           },
           tools: TOOLS.map((t) => ({ name: t.name, description: t.description })),
+        });
+      }
+
+      case "bg_dp_list_sources": {
+        return textContent({
+          sources: [
+            {
+              id: "cpdp",
+              name: "CPDP — Комисия за защита на личните данни",
+              name_en: "Commission for Personal Data Protection",
+              url: "https://www.cpdp.bg/",
+              authority: "Bulgarian Data Protection Authority",
+              jurisdiction: "Bulgaria",
+              license: "Open government data — official regulatory publications",
+              update_frequency: "Periodic",
+              coverage: "Decisions (решения, наказателни постановления, предписания), guidelines (становища, насоки, методически указания), and topics",
+            },
+          ],
+        });
+      }
+
+      case "bg_dp_check_data_freshness": {
+        const stats = getDbStats();
+        return textContent({
+          status: "ok",
+          database_path: process.env["CPDP_DB_PATH"] ?? "data/cpdp.db",
+          record_counts: {
+            decisions: stats.decisions_count,
+            guidelines: stats.guidelines_count,
+            topics: stats.topics_count,
+          },
+          latest_dates: {
+            decision: stats.latest_decision_date ?? "none",
+            guideline: stats.latest_guideline_date ?? "none",
+          },
+          note: "Database updates are periodic. Verify against https://www.cpdp.bg/ for the most recent publications.",
         });
       }
 
