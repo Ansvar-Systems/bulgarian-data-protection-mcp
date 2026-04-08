@@ -261,3 +261,23 @@ export function listTopics(): Topic[] {
     .prepare("SELECT * FROM topics ORDER BY id")
     .all() as Topic[];
 }
+
+// --- Stats / freshness --------------------------------------------------------
+
+export interface DbStats {
+  decisions_count: number;
+  guidelines_count: number;
+  topics_count: number;
+  latest_decision_date: string | null;
+  latest_guideline_date: string | null;
+}
+
+export function getDbStats(): DbStats {
+  const db = getDb();
+  const decisions_count = (db.prepare("SELECT COUNT(*) as n FROM decisions").get() as { n: number }).n;
+  const guidelines_count = (db.prepare("SELECT COUNT(*) as n FROM guidelines").get() as { n: number }).n;
+  const topics_count = (db.prepare("SELECT COUNT(*) as n FROM topics").get() as { n: number }).n;
+  const latest_decision_date = (db.prepare("SELECT MAX(date) as d FROM decisions").get() as { d: string | null }).d;
+  const latest_guideline_date = (db.prepare("SELECT MAX(date) as d FROM guidelines").get() as { d: string | null }).d;
+  return { decisions_count, guidelines_count, topics_count, latest_decision_date, latest_guideline_date };
+}
