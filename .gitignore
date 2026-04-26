@@ -35,6 +35,9 @@ data/*.csv
 data/*.json.gz
 data/*.zip
 
+# Ingest runtime state (auto-generated, not source-controlled)
+data/ingest-state.json
+
 # ───────────────────────────────────────────────────────────────────────────
 # ENVIRONMENT
 # ───────────────────────────────────────────────────────────────────────────
