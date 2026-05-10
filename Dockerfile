@@ -8,31 +8,48 @@
 # Override with CPDP_DB_PATH for a custom location.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# --- Stage 1: Build TypeScript ---
-FROM node:20-slim AS builder
+# --- Stage 1: Build TypeScript + native bindings ---
+FROM node:20-alpine AS builder
+
+# Toolchain needed for better-sqlite3 native build
+RUN apk add --no-cache python3 make g++
 
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src/ src/
+COPY scripts/ scripts/
+
+# Install deps (postinstall runs to fetch/build better-sqlite3 binding),
+# then explicitly rebuild against the runtime Node ABI.
+RUN npm ci && npm rebuild better-sqlite3
+
 RUN npm run build
 
 # --- Stage 2: Production ---
-FROM node:20-slim AS production
+FROM node:20-alpine AS production
 
 WORKDIR /app
 ENV NODE_ENV=production
 ENV CPDP_DB_PATH=/app/data/cpdp.db
 
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
+# Copy already-built node_modules (with native binding intact) from builder
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/dist ./dist
+COPY package.json ./
 
-COPY --from=builder /app/dist/ dist/
+# Bake the operational DB into the image so the container is self-contained.
+# (The CI workflow gunzips the GitHub Release asset to data/database.db before
+# build; locally the repo's data/cpdp.db is used directly.)
+COPY data/database.db data/cpdp.db
+
+# Preserve scripts dir so tsc rootDir invariants stay aligned with what was
+# compiled in builder (CMD path is dist/src/http-server.js).
+COPY scripts/ ./scripts/
 
 # Non-root user for security
-RUN addgroup --system --gid 1001 mcp && \
-    adduser --system --uid 1001 --ingroup mcp mcp && \
+RUN addgroup -S -g 1001 mcp && \
+    adduser -S -u 1001 -G mcp mcp && \
     chown -R mcp:mcp /app
 USER mcp
 
